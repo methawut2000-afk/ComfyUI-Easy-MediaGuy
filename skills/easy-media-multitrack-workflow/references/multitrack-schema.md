@@ -125,7 +125,7 @@ custom 示例：
 ```
 
 - `task_mode`: `default`、`l2v`、`ref`、`edit`。
-- `continuity_mode`: `shot`（独立镜头）、`context`（普通上下文衔接）或 `context_swap`（上下文主体替换）。
+- `continuity_mode`: `shot`（独立镜头）、`context`（普通上下文衔接）、`context_swap`（上下文主体替换）或 `repair_context`（使用前一段作为 Forward Context，并用后一段首帧作为 Backward Guide 修复当前片段）。
 - `ref_image_size`: `match` 或 `max`。
 - `images` 最多 9 张，顺序决定 Picture 引用顺序。
 - 编辑已有任务时保留未要求改变的 `system_prompt`、prompt variant、连续性和参考图策略。

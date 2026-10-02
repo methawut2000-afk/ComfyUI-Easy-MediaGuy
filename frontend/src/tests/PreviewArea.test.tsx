@@ -784,7 +784,7 @@ describe('PreviewArea', () => {
     }])
   })
 
-  it('shows MiniMax continuity mode beside task mode from the second active task onward', () => {
+  it('shows MiniMax continuity mode beside task mode for active tasks', () => {
     const { data } = trackData()
     addActiveTaskTrack(data)
     data.tracks[0].segments[1].content.continuity_mode = 'shot'
@@ -816,7 +816,7 @@ describe('PreviewArea', () => {
     }])
 
     view.rerender(<PreviewArea {...props} currentTime={12} />)
-    expect(screen.queryByTestId('task-continuity-mode-select')).toBeNull()
+    expect(screen.getByTestId('task-continuity-mode-select')).toBeTruthy()
 
     view.rerender(
       <PreviewArea

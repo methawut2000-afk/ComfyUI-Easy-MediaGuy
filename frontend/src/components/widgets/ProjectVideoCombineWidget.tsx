@@ -920,7 +920,9 @@ export function ProjectVideoCombineWidget({ value, onChange, app, node }: Readon
                                 ? 'projectVideoCombine.continuityShot'
                                 : clip.continuity_mode === 'context_swap'
                                   ? 'projectVideoCombine.continuityContextSwap'
-                                  : 'projectVideoCombine.continuityContext'),
+                                  : clip.continuity_mode === 'repair_context'
+                                    ? 'projectVideoCombine.continuityRepairContext'
+                                    : 'projectVideoCombine.continuityContext'),
                             })}
                           </span>
                         </div>
