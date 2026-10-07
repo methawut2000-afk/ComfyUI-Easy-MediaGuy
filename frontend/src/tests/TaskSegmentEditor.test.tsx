@@ -122,7 +122,7 @@ describe('TaskSegmentEditor', () => {
     expect(onContentChange).toHaveBeenCalledWith({ user_prompt: 'New prompt' })
   })
 
-  it('shows and stores MiniMax continuity mode from the second task onward', () => {
+  it('shows and stores MiniMax continuity mode including the first task', () => {
     const onContentChange = vi.fn()
     const first = taskSegment()
     const second = secondTaskSegment()
@@ -144,6 +144,9 @@ describe('TaskSegmentEditor', () => {
     fireEvent.click(continuitySelect)
     fireEvent.click(screen.getByRole('option', { name: 'Swap Context' }))
     expect(onContentChange).toHaveBeenCalledWith({ continuity_mode: 'context_swap' })
+    fireEvent.click(continuitySelect)
+    fireEvent.click(screen.getByRole('option', { name: 'Repair Context' }))
+    expect(onContentChange).toHaveBeenCalledWith({ continuity_mode: 'repair_context' })
 
     rerender(
       <TaskSegmentEditor
@@ -153,7 +156,10 @@ describe('TaskSegmentEditor', () => {
         onContentChange={onContentChange}
       />,
     )
-    expect(screen.queryByRole('combobox', { name: 'Continuity mode' })).toBeNull()
+    const firstContinuitySelect = screen.getByRole('combobox', { name: 'Continuity mode' })
+    fireEvent.click(firstContinuitySelect)
+    fireEvent.click(screen.getByRole('option', { name: 'Repair Context' }))
+    expect(onContentChange).toHaveBeenCalledWith({ continuity_mode: 'repair_context' })
 
     rerender(
       <TaskSegmentEditor

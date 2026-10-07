@@ -1313,6 +1313,32 @@ def test_h3_project_passthrough_shot_keeps_outgoing_context(monkeypatch):
     assert artifact["inputs"]["continuity_mode"] == "shot"
 
 
+def test_h3_repair_context_node_schema_exposes_boundary_inputs(monkeypatch):
+    module = _load_minimax_node(monkeypatch)
+    schema = module.EasyMiniMaxH3RepairContext.define_schema()
+    inputs = {item.name: item for item in schema.inputs}
+
+    assert schema.node_id == "easy MiniMaxH3RepairContext"
+    assert list(inputs) == [
+        "conditioning",
+        "vae",
+        "latent",
+        "context_latent",
+        "project_name",
+        "backward_segment_index",
+        "context_length",
+        "video_transition_steps",
+        "audio_transition_steps",
+    ]
+    assert inputs["context_latent"].kwargs["optional"] is True
+    assert inputs["backward_segment_index"].kwargs["optional"] is True
+    assert [output.name for output in schema.outputs] == [
+        "conditioning",
+        "trim_frames",
+        "latent",
+    ]
+
+
 def test_h3_project_task_passthrough_can_mix_with_sampling(monkeypatch):
     module = _load_minimax_node(monkeypatch)
     inputs = _h3_project_inputs()
@@ -1383,7 +1409,7 @@ def test_h3_project_single_task_passthrough_skips_prior_context_and_sampler(monk
     assert "easy minimaxH3ToVideo" not in types
 
 
-@pytest.mark.parametrize("continuity_mode", ["shot", "context", "context_swap"])
+@pytest.mark.parametrize("continuity_mode", ["shot", "context", "context_swap", "repair_context"])
 def test_h3_project_passthrough_ignores_continuity_mode_and_encodes_tail(
     monkeypatch, continuity_mode,
 ):

@@ -527,6 +527,10 @@ def _reencoded_anchor_av_latent(
     """Hard-pin a short re-encoded video anchor at the end of a soft prefix."""
     context_steps = _steps_for_frames(int(context_frames))
     anchor_video_steps = _steps_for_frames(int(anchor_frames))
+    if int(anchor_frames) > int(context_frames):
+        raise ValueError(
+            "easy h3 anchor context: anchor length cannot exceed context length"
+        )
     if context_steps is None or anchor_video_steps is None:
         raise ValueError(
             "easy h3 anchor context: context and anchor lengths must align "
@@ -607,7 +611,15 @@ def _video_anchor_from_context_latent(
             raise ValueError(
                 "easy h3 anchor context: anchor_samples must be [B,C,T,H,W]"
             )
-        return {"samples": anchor_samples}
+        stored_frames = _pixel_frames(int(anchor_samples.shape[2]))
+        if stored_frames == int(anchor_frames):
+            return {"samples": anchor_samples}
+        LOGGER.debug(
+            "Stored H3 anchor is %d frames, requested %d; extracting the requested "
+            "span from the context tail instead.",
+            stored_frames,
+            int(anchor_frames),
+        )
     blocks, _, covered = _video_tail_from_latent(context_latent, int(anchor_frames))
     if covered != int(anchor_frames):
         raise RuntimeError("easy h3 anchor context: video anchor span changed")
@@ -645,6 +657,79 @@ def apply_reencoded_anchor_motion_context(
         anchor_frames=int(anchor_length),
     )
     return output, trim_frames, anchored
+
+
+def apply_repair_context(
+    conditioning: Any,
+    vae: Any,
+    latent: dict[str, Any],
+    context_latent: dict[str, Any] | None = None,
+    backward_frame: torch.Tensor | None = None,
+    context_length: int | str = "22",
+    anchor_frames: int = 5,
+    video_transition_steps: int = 4,
+    audio_transition_steps: int = 4,
+) -> tuple[Any, int, dict[str, Any]]:
+    """Repair a segment using optional forward context and future boundary guidance."""
+    working_conditioning = conditioning
+    working_latent = latent
+    trim_frames = 0
+
+    if context_latent is not None:
+        working_conditioning, trim_frames, working_latent = (
+            apply_reencoded_anchor_motion_context(
+                conditioning=working_conditioning,
+                vae=vae,
+                latent=working_latent,
+                context_latent=context_latent,
+                context_length=context_length,
+                anchor_length=str(anchor_frames),
+            )
+        )
+
+    if backward_frame is None:
+        return working_conditioning, trim_frames, working_latent
+
+    target_video = _video_from_latent(latent)
+    target_width = int(target_video.shape[4]) * 16
+    target_height = int(target_video.shape[3]) * 16
+    if not isinstance(backward_frame, torch.Tensor) or backward_frame.ndim not in {3, 4}:
+        raise ValueError(
+            "easy h3 repair context: backward_frame must be an image tensor "
+            "[H,W,C] or [N,H,W,C]"
+        )
+    guide = backward_frame[:1] if backward_frame.ndim == 4 else backward_frame.unsqueeze(0)
+    if int(guide.shape[-1]) < 3:
+        raise ValueError("easy h3 repair context: backward_frame must contain RGB channels")
+    guide = _resize_frames(guide[..., :3], target_width, target_height)
+    guide_latent = vae.encode(guide)
+    if getattr(guide_latent, "ndim", 0) != 5:
+        raise ValueError("easy h3 repair context: VAE returned an invalid boundary latent")
+
+    target_frame = max(0, _pixel_frames(int(target_video.shape[2])) - 1)
+    output = []
+    for embedding, metadata in working_conditioning:
+        values = metadata.copy()
+        previous_keyframes = values.get("minimax_keyframes") or []
+        kept_keyframes = [
+            dict(keyframe)
+            for keyframe in previous_keyframes
+            if keyframe.get("resolved_frame_index", 0) != target_frame
+        ]
+        kept_keyframes.append({
+            "resolved_frame_index": target_frame,
+            "latent": guide_latent,
+            "repair_backward_guide": True,
+        })
+        values["minimax_keyframes"] = kept_keyframes
+        output.append([embedding, values])
+
+    LOGGER.info(
+        "H3 Repair Context: forward=%s, backward boundary frame=%d",
+        context_latent is not None,
+        target_frame,
+    )
+    return output, trim_frames, working_latent
 
 
 def apply_hard_motion_context(
@@ -859,6 +944,13 @@ def apply_motion_context(
             snapped_frames,
         )
     pinned_frames = snapped_frames
+    LOGGER.info(
+        "H3 Context Verification: requested=%d frames, available=%d frames, applied=%d frames, source=%s",
+        requested_frames,
+        available_frames,
+        pinned_frames,
+        source_kind,
+    )
     if pinned_frames >= target_frames:
         raise ValueError(
             "easy h3 motion context: the pinned context must be shorter than "

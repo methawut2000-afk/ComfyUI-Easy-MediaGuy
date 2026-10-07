@@ -1227,7 +1227,7 @@ export function TaskSegmentEditor({
         </div>
 
         <div className="flex items-center gap-2">
-          {format === 'MiniMax' && mode !== 'passthrough' && (taskIndex > 0 || hasSelectedContinuityTargets) && (
+          {format === 'MiniMax' && mode !== 'passthrough' && (
             <Select
               value={continuityMode}
               onValueChange={(value) => handleDropdownContentChange({

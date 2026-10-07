@@ -36,6 +36,12 @@ from utils.h3_project import (  # noqa: E402
 )
 
 
+from utils import h3_project
+
+def test_h3_continuity_mode_accepts_repair_context():
+    assert h3_project._h3_continuity_mode("repair_context") == "repair_context"
+
+
 def test_h3_latent_loader_requires_safetensors_extension(tmp_path):
     with pytest.raises(ValueError, match="must use .safetensors"):
         load_h3_latent(tmp_path / "context_latent_0_1.pt")

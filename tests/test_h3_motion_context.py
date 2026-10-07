@@ -101,6 +101,45 @@ def test_h3_motion_context_latent_path_uses_native_keyframes_and_keeps_refs():
     assert "minimax_frame_count" not in metadata
 
 
+def test_h3_repair_context_adds_future_boundary_keyframe_without_overwriting_refs():
+    target = _video_latent(video_steps=2)
+    references = [{"kind": "image", "marker": "keep"}]
+
+    class FakeVAE:
+        def encode(self, pixels):
+            return torch.zeros(1, 24, 1, 2, 2)
+
+    conditioning = [[torch.tensor([1.0]), {
+        "minimax_refs": references,
+        "minimax_keyframes": [
+            {"resolved_frame_index": core._pixel_frames(2) - 1, "latent": torch.ones(1, 24, 1, 2, 2)},
+        ],
+    }]]
+
+    original_resize = core._resize_frames
+    core._resize_frames = lambda frames, width, height: frames
+    try:
+        output, trim_frames, returned_latent = core.apply_repair_context(
+            conditioning=conditioning,
+            vae=FakeVAE(),
+            latent=target,
+            backward_frame=torch.zeros(1, 2, 2, 3),
+        )
+    finally:
+        core._resize_frames = original_resize
+
+    metadata = output[0][1]
+    assert trim_frames == 0
+    assert returned_latent is target
+    assert metadata["minimax_refs"] is references
+    guides = [
+        keyframe for keyframe in metadata["minimax_keyframes"]
+        if keyframe.get("repair_backward_guide") is True
+    ]
+    assert len(guides) == 1
+    assert guides[0]["resolved_frame_index"] == core._pixel_frames(2) - 1
+
+
 def test_h3_motion_context_rejects_latent_resolution_change():
     with pytest.raises(ValueError, match="does not match target"):
         core.apply_motion_context(

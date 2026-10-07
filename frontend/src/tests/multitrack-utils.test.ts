@@ -1495,6 +1495,24 @@ describe('multitrack utilities', () => {
     expect(normalized.tracks[0].segments[0].content.continuity_mode).toBe('context_swap')
   })
 
+  it('preserves repair context continuity while normalizing track data', () => {
+    const data = createDefaultTrackData()
+    data.tracks[0].segments = [{
+      id: 'repair-task',
+      start_frame: 0,
+      end_frame: 120,
+      color: 'var(--multitrack-task-bg)',
+      content: {
+        media_type: 'none',
+        continuity_mode: 'repair_context',
+      },
+    }]
+
+    const normalized = normalizeTrackData(data)
+
+    expect(normalized.tracks[0].segments[0].content.continuity_mode).toBe('repair_context')
+  })
+
   it('does not add a default task segment when the range already has task coverage', () => {
     const data = createDefaultTrackData()
     const withTask = addDefaultTaskSegmentIfRangeEmpty(data.tracks, 2, 5)

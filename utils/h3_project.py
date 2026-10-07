@@ -261,7 +261,7 @@ def _h3_continuity_mode(value: Any) -> str:
     normalized = str(value or "shot").lower()
     if normalized == "context_test":
         return "context"
-    return normalized if normalized in {"context", "context_swap"} else "shot"
+    return normalized if normalized in {"context", "context_swap", "repair_context"} else "shot"
 
 
 def h3_task_segments(info: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1074,6 +1074,29 @@ def select_h3_project_video(
         temporary.unlink(missing_ok=True)
         raise RuntimeError(f"Failed to select project video: {error}") from error
     return _h3_project_data(project_name, project_dir, manifest)
+
+
+def get_h3_project_video_path(project_name: str, segment_index: int) -> Path:
+    """Return the active rendered video path for an H3 project segment."""
+    project_dir, manifest = _load_h3_manifest(project_name)
+    segments = manifest.get("segments", {})
+    segment = segments.get(str(int(segment_index))) if isinstance(segments, dict) else None
+    if not isinstance(segment, dict):
+        raise FileNotFoundError(
+            f"H3 project segment {int(segment_index)} was not found in {project_dir / 'project.json'}"
+        )
+    generations = segment.get("generations")
+    if not isinstance(generations, dict):
+        raise FileNotFoundError(
+            f"H3 project segment {int(segment_index)} has no generations"
+        )
+    active_key = str(segment.get("active_generation", ""))
+    generation = generations.get(active_key)
+    if not isinstance(generation, dict) or not generation.get("video"):
+        raise FileNotFoundError(
+            f"H3 project segment {int(segment_index)} has no active rendered video"
+        )
+    return _project_child_path(project_dir, generation["video"])
 
 
 def load_h3_project_data(project_name: Any) -> dict[str, Any]:

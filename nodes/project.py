@@ -29,6 +29,7 @@ from ..utils.h3_project import (
     h3_task_is_passthrough,
     h3_task_type,
     initialize_h3_project,
+    get_h3_project_video_path,
     parse_tracks_info,
     crop_multitrack_project_media,
     prepare_multitrack_project_media,
@@ -53,7 +54,7 @@ TYPE_FAST_MODEL_LOADER = io.Custom(io_type="FAST_MODEL_LOADER")
 TYPE_TRACKS_INFO = io.Custom(io_type="TRACKS_INFO")
 TYPE_PROJECT_DATA = io.Custom(io_type="PROJECT_DATA")
 TYPE_H3_PROJECT_STATIC_DATA = io.Custom(io_type="H3_PROJECT_STATIC_DATA")
-H3_CONTEXT_CONTINUITY_MODES = {"context", "context_swap"}
+H3_CONTEXT_CONTINUITY_MODES = {"context", "context_swap", "repair_context"}
 H3_CONTEXT_SOURCE_FRAMES = 22
 
 
@@ -931,6 +932,36 @@ class EasyMultiTrackProject(io.ComfyNode):
                         "mode preserves existing video and latent files."
                     ),
                 ),
+                io.String.Input(
+                    "repair_segments",
+                    default="",
+                    tooltip=(
+                        "Optional Repair Context targets. Enter segment numbers separated by commas, "
+                        "for example 2,4,7. Selected segments are temporary Repair Context targets "
+                        "for this run only; the original Editor modes are never overwritten."
+                    ),
+                ),
+                io.Int.Input(
+                    "context_frames",
+                    default=22,
+                    min=1,
+                    max=124,
+                    step=1,
+                    tooltip=(
+                        "Requested soft H3 Context frame count. Type any value. H3 snaps it down to "
+                        "the nearest supported temporal-grid value and reports the actual value used."
+                    ),
+                ),
+                io.Int.Input(
+                    "reference_frames",
+                    default=5,
+                    min=1,
+                    max=124,
+                    step=1,
+                    tooltip=(
+                        "H3 hard video anchor/reference span. Keep this no larger than Context Frames."
+                    ),
+                ),
                 io.Int.Input(
                     "seed",
                     default=42,
@@ -1188,17 +1219,81 @@ class EasyMultiTrackProject(io.ComfyNode):
             output_info,
             folder_paths.get_output_directory(),
         )
+        repair_segments_raw = _first_input(kwargs.get("repair_segments"), "")
+        repair_segments: list[int] = []
+        if isinstance(repair_segments_raw, str) and repair_segments_raw.strip():
+            tokens = [token.strip() for token in repair_segments_raw.split(",") if token.strip()]
+            try:
+                repair_segments = sorted({int(token) for token in tokens})
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "repair_segments must contain comma-separated positive segment numbers, e.g. 2,4,7"
+                ) from error
+            if any(number < 1 for number in repair_segments):
+                raise ValueError("repair_segments must contain only positive segment numbers")
+
+        # Work on a private copy so Repair Context is temporary and the Editor's
+        # original per-segment modes are never overwritten.
+        if repair_segments:
+            info = copy.deepcopy(info)
+            task_segments = sorted(
+                [
+                    segment
+                    for track in info.get("tracks", [])
+                    if isinstance(track, dict) and track.get("type") == "task"
+                    for segment in track.get("segments", [])
+                    if isinstance(segment, dict)
+                ],
+                key=lambda segment: int(segment.get("start_frame", 0) or 0),
+            )
+            if not task_segments:
+                raise ValueError("repair_segments was provided, but the project has no task segments")
+            invalid = [number for number in repair_segments if number > len(task_segments)]
+            if invalid:
+                raise ValueError(
+                    "repair_segments contains unavailable segment(s): "
+                    + ", ".join(map(str, invalid))
+                )
+            for number in repair_segments:
+                content = task_segments[number - 1].get("content")
+                if not isinstance(content, dict):
+                    content = {}
+                    task_segments[number - 1]["content"] = content
+                content["continuity_mode"] = "repair_context"
+            log_node_info(
+                node_name,
+                "Repair Context selection: " + ", ".join(f"S{number}" for number in repair_segments),
+            )
+
         all_entries = h3_task_entries(info)
         segment_start_number = int(_first_input(kwargs.get("segment_start_number"), 1))
         if segment_start_number < 1:
             raise ValueError("segment_start_number must be at least 1")
         segment_start_index = segment_start_number - 1
         segment_count = int(_first_input(kwargs.get("segment_count"), -1))
-        selected_entries = select_h3_task_entries(
-            all_entries,
-            segment_start_index,
-            segment_count,
-        )
+        context_frames = int(_first_input(kwargs.get("context_frames"), H3_CONTEXT_SOURCE_FRAMES))
+        if context_frames < 1 or context_frames > 124:
+            raise ValueError("context_frames must be between 1 and 124")
+        reference_frames = int(_first_input(kwargs.get("reference_frames"), 5))
+        if reference_frames < 1 or reference_frames > 124:
+            raise ValueError("reference_frames must be between 1 and 124")
+        if reference_frames > context_frames:
+            raise ValueError(
+                f"reference_frames ({reference_frames}) cannot exceed context_frames ({context_frames})"
+            )
+        if repair_segments:
+            repair_set = set(repair_segments)
+            selected_entries = [
+                (index, entry)
+                for index, entry in enumerate(all_entries)
+                if (index + 1) in repair_set
+            ]
+        else:
+            selected_entries = select_h3_task_entries(
+                all_entries,
+                segment_start_index,
+                segment_count,
+            )
         if not selected_entries:
             raise ValueError(
                 "No H3 task segments are available from segment_start_number."
@@ -1261,6 +1356,20 @@ class EasyMultiTrackProject(io.ComfyNode):
                     f"{previous_index + 1} has no active low-resolution context "
                     "latent. Regenerate the previous segment with SelfLift first."
                 )
+        if (
+            first_selected_continuity == "repair_context"
+            and not is_passthrough
+            and not h3_task_is_passthrough(first_selected_entry)
+            and first_selected_index + 1 < len(all_entries)
+        ):
+            try:
+                get_h3_project_video_path(safe_project_name, first_selected_index + 1)
+            except (FileNotFoundError, ValueError) as error:
+                raise ValueError(
+                    f"Cannot start segment {first_selected_index + 1} with repair_context: "
+                    f"segment {first_selected_index + 2} has no active rendered video "
+                    "for the backward guide. Generate or restore that segment first."
+                ) from error
         resume_task_index: int | None = None
         if run_second_pass and selected_entries:
             first_selected_index = selected_entries[0][0]
@@ -1274,6 +1383,21 @@ class EasyMultiTrackProject(io.ComfyNode):
                     node_name,
                     f"Resuming segment {first_selected_index} from its first-pass checkpoint",
                 )
+
+        repair_requires_downstream_video = any(
+            isinstance(entry.get("task"), dict)
+            and isinstance(entry["task"].get("content"), dict)
+            and str(entry["task"]["content"].get("continuity_mode", "shot")).lower()
+            == "repair_context"
+            and task_index + 1 < len(all_entries)
+            for task_index, entry in selected_entries
+        )
+        if project_save == "override" and segment_count == -1 and repair_requires_downstream_video:
+            raise ValueError(
+                "repair_context with a downstream Backward Guide requires "
+                "project_save='new'. Override clears downstream generations before "
+                "the guide can be read."
+            )
 
         if project_save == "override" and segment_count == -1:
             clear_h3_project_segments_from(
@@ -1359,8 +1483,40 @@ class EasyMultiTrackProject(io.ComfyNode):
             audio_vae, preview_vae = project_model_static.out(6), project_model_static.out(7)
             full_locked_audio = project_media_static.out(8)
             first_pass_sampler, first_pass_sigmas = project_model_static.out(9), project_model_static.out(10)
-            second_pass_sampler, second_pass_sigmas = project_model_static.out(11), project_model_static.out(12)
-            context_second_pass_sigmas = project_model_static.out(13)
+
+            # H3 FIX: Do not consume the second-pass sampling outputs from
+            # H3 Project Static Prepare in the linked/lazy execution path.
+            # Those outputs can materialize as None at the segment expansion
+            # boundary even when sampler_2nd/sigmas_2nd are connected.
+            # Resolve the second-pass pair directly in this project graph,
+            # exactly like the non-linked path does.
+            second_pass_sampler = second_pass_sigmas = context_second_pass_sigmas = None
+            if run_second_pass and has_sampling_tasks:
+                configured_sampler = _first_input(
+                    sampling_config.get("sampler_2nd"),
+                    _raw_project_input(kwargs.get("sampler_2nd")),
+                )
+                configured_sigmas = _first_input(
+                    sampling_config.get("sigmas_2nd"),
+                    _raw_project_input(kwargs.get("sigmas_2nd")),
+                )
+                second_pass_sampler, second_pass_sigmas = _h3_resolve_pass_sampling(
+                    graph,
+                    pass_name="second_pass",
+                    sampler=configured_sampler,
+                    sigmas=configured_sigmas,
+                    preset_name=preset_name,
+                    has_second_pass=True,
+                    is_turbo=second_is_turbo,
+                )
+                if has_context_second_pass:
+                    custom_second = configured_sampler is not None or configured_sigmas is not None
+                    context_second_pass_sigmas = _h3_resolve_context_second_pass_sigmas(
+                        graph,
+                        preset_name=preset_name,
+                        is_turbo=second_is_turbo,
+                        has_custom_second_pass_sampling=custom_second,
+                    )
             task_tracks_info_base = shared_images = shared_audio = shared_video = None
         else:
             (task_tracks_info_base, shared_images, shared_audio, shared_video,
@@ -1504,12 +1660,14 @@ class EasyMultiTrackProject(io.ComfyNode):
                 context_latent = _h3_encode_context_media(
                     graph, passthrough.out(1), passthrough.out(2), vae, audio_vae,
                     f"passthrough_context_{task_index}",
+                    context_frames=context_frames,
                 )
                 runtime_context_latent = graph.node(
                     "easy h3MotionContextLatentTrim",
                     id=f"trim_hires_context_latent_{task_index}",
                     latent=context_latent,
-                    context_length=str(H3_CONTEXT_SOURCE_FRAMES),
+                    context_length=str(context_frames),
+                    anchor_frames=reference_frames,
                 ).out(0)
                 saved_video_end = graph.node(
                     "easy h3SegmentSaveEnd",
@@ -1554,6 +1712,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 continuity_mode = "context"
             uses_context = continuity_mode in H3_CONTEXT_CONTINUITY_MODES
             uses_swap = continuity_mode == "context_swap"
+            uses_repair = continuity_mode == "repair_context"
             aligned_task_length: Any = (
                 minimax_frame_count(base_task_length, round_up=True)
                 if preserve_source_timing
@@ -1564,8 +1723,16 @@ class EasyMultiTrackProject(io.ComfyNode):
                 uses_context
                 and (previous_hires_context_latent is not None or task_index > 0)
             )
-            context_source_frames = H3_CONTEXT_SOURCE_FRAMES
-            context_generation_frames = 34
+            # The hard reference/anchor may be larger than the historical five-frame
+            # default. Keep the soft context at least as long as the requested anchor,
+            # otherwise the anchor cannot be copied from the context latent.
+            context_source_frames = context_frames
+            context_generation_frames = context_source_frames + 12
+            log_node_info(
+                node_name,
+                f"S{task_index + 1} H3 Context requested={context_frames} frames; "
+                f"hard anchor={reference_frames} frames",
+            )
             if will_have_context_continuity:
                 task_length = graph.node(
                     "ComfyMathExpression",
@@ -1632,15 +1799,21 @@ class EasyMultiTrackProject(io.ComfyNode):
 
             if (
                 uses_context
-                and previous_hires_context_latent is None
                 and task_index > 0
+                and (previous_hires_context_latent is None or uses_repair)
             ):
                 report_segment_step(0.14)
+                forward_segment_index = task_index - 1
+                if uses_repair:
+                    # Repair targets may be non-contiguous (for example S2 and S4).
+                    # Always load the real preceding segment from the saved project.
+                    previous_hires_context_latent = None
+                    previous_low_context_latent = None
                 loaded_hires_context = graph.node(
                     "easy h3ProjectContextLatentLoad",
                     id=f"load_hires_context_{task_index}",
                     project_name=safe_project_name,
-                    segment_index=task_index - 1,
+                    segment_index=forward_segment_index,
                     resolution="high",
                 )
                 previous_hires_context_latent = loaded_hires_context.out(0)
@@ -1649,7 +1822,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         "easy h3ProjectContextLatentLoad",
                         id=f"load_low_context_{task_index}",
                         project_name=safe_project_name,
-                        segment_index=task_index - 1,
+                        segment_index=forward_segment_index,
                         resolution="low",
                     )
                     previous_low_context_latent = loaded_low_context.out(0)
@@ -1688,7 +1861,34 @@ class EasyMultiTrackProject(io.ComfyNode):
                 ).out(0)
 
             first_pass_sampling_model = model
-            if has_context_continuity:
+            if uses_repair:
+                report_segment_step(0.22)
+                repair_inputs: dict[str, Any] = {
+                    "conditioning": positive,
+                    "vae": vae,
+                    "latent": initial_latent,
+                    "project_name": safe_project_name,
+                    "context_length": str(context_source_frames),
+                    "anchor_frames": reference_frames,
+                    "video_transition_steps": 4,
+                    "audio_transition_steps": 4,
+                }
+                repair_backward_segment_index: int | None = None
+                if first_pass_context_latent is not None:
+                    repair_inputs["context_latent"] = first_pass_context_latent
+                if task_index + 1 < len(all_entries):
+                    repair_backward_segment_index = task_index + 1
+                    repair_inputs["backward_segment_index"] = repair_backward_segment_index
+                repair_context = graph.node(
+                    "easy MiniMaxH3RepairContext",
+                    id=f"repair_context_{task_index}",
+                    **repair_inputs,
+                )
+                positive = repair_context.out(0)
+                first_pass_context_trim_frames = repair_context.out(1)
+                context_trim_frames = first_pass_context_trim_frames
+                initial_latent = repair_context.out(2)
+            elif has_context_continuity:
                 report_segment_step(0.22)
                 if uses_swap:
                     context_swap = graph.node(
@@ -1716,6 +1916,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         latent=initial_latent,
                         context_latent=first_pass_context_latent,
                         context_length=str(context_source_frames),
+                        anchor_frames=reference_frames,
                         video_transition_steps=4,
                         audio_transition_steps=4,
                         video_anchor_only=not audio_only,
@@ -1922,12 +2123,33 @@ class EasyMultiTrackProject(io.ComfyNode):
                         id=f"hires_continuity_{task_index}",
                         current_hires_latent=upscaled_latent,
                         previous_hires_latent=previous_hires_context_latent,
-                        context_length=str(H3_CONTEXT_SOURCE_FRAMES),
+                        context_length=str(context_source_frames),
+                        anchor_frames=reference_frames,
                         video_transition_steps=4,
                         video_anchor_only=not audio_only,
                     )
                     upscaled_latent = hires_continuity.out(0)
                     context_trim_frames = hires_continuity.out(1)
+
+                if uses_repair and repair_backward_segment_index is not None:
+                    # Reapply the future-boundary guide at final sampling resolution.
+                    # The first-pass conditioning is tied to its own canvas size, so the
+                    # guide must be encoded again against the second-pass latent.
+                    report_segment_step(0.60)
+                    second_pass_repair = graph.node(
+                        "easy MiniMaxH3RepairContext",
+                        id=f"second_pass_repair_context_{task_index}",
+                        conditioning=second_pass_positive,
+                        vae=vae,
+                        latent=upscaled_latent,
+                        project_name=safe_project_name,
+                        backward_segment_index=repair_backward_segment_index,
+                        context_length=str(context_source_frames),
+                        anchor_frames=reference_frames,
+                        video_transition_steps=4,
+                        audio_transition_steps=4,
+                    )
+                    second_pass_positive = second_pass_repair.out(0)
 
                 report_segment_step(0.62)
                 second_pass_noise = graph.node(
@@ -2112,6 +2334,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                         vae,
                         audio_vae,
                         f"hires_context_{task_index}",
+                        context_frames=context_source_frames,
                     )
                     hires_context_reencoded = True
                     if (has_second_pass and run_second_pass) or (
@@ -2155,6 +2378,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                             vae,
                             audio_vae,
                             f"low_context_{task_index}",
+                            context_frames=context_source_frames,
                         )
                         low_context_reencoded = True
                     else:
@@ -2192,6 +2416,7 @@ class EasyMultiTrackProject(io.ComfyNode):
             hires_trim_inputs: dict[str, Any] = {
                 "latent": saved_hires_context_latent,
                 "context_length": str(context_source_frames),
+                "anchor_frames": reference_frames,
             }
             if not audio_only and not hires_context_reencoded:
                 hires_trim_inputs.update({"anchor_images": output_images, "vae": vae})
@@ -2204,6 +2429,7 @@ class EasyMultiTrackProject(io.ComfyNode):
                 low_trim_inputs: dict[str, Any] = {
                     "latent": saved_low_context_latent,
                     "context_length": str(context_source_frames),
+                    "anchor_frames": reference_frames,
                 }
                 if not audio_only and not low_context_reencoded:
                     low_anchor_images = low_delivered_images
